@@ -43,13 +43,16 @@ Version: 0.3.0
 import json
 import logging
 import os
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
-from phue import Bridge
+from phue import Bridge, PhueRegistrationException
+import asyncio
+import socket
 
 # --- Configuration ---
 # You can customize these values or load from a config file
@@ -65,6 +68,31 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 logging.basicConfig(level=logging.INFO,
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("hue-mcp")
+
+# --- Helper Functions ---
+
+def get_local_ip() -> str:
+    """
+    Get the local IP address of the machine.
+    Uses a dummy connection to determine the interface IP used for routing.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # doesn't even have to be reachable
+        s.connect(('10.255.255.255', 1))
+        IP = s.getsockname()[0]
+    except Exception:
+        IP = '127.0.0.1'
+    finally:
+        s.close()
+    return IP
+
+def get_subnet(ip: str) -> str:
+    """
+    Get the subnet (first 3 octets) of an IP address.
+    Example: 192.168.1.100 -> 192.168.1
+    """
+    return '.'.join(ip.split('.')[:3])
 
 # --- Server Context Setup ---
 
@@ -87,41 +115,132 @@ async def hue_lifespan(server: FastMCP) -> AsyncIterator[HueContext]:
     # Ensure config directory exists
     os.makedirs(CONFIG_DIR, exist_ok=True)
 
-    # Load saved config if it exists
+    # Get local subnet for matching
+    local_ip = get_local_ip()
+    local_subnet = get_subnet(local_ip)
+    logger.info(f"Detected local IP: {local_ip}, Subnet: {local_subnet}")
+
     bridge_ip = BRIDGE_IP
     bridge_username = None
+    config = {}
 
+    # Load and potentially migrate config
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE) as f:
                 config = json.load(f)
-                bridge_ip = config.get('bridge_ip', bridge_ip)
-                bridge_username = config.get('username')
-                logger.info(f"Loaded configuration from {CONFIG_FILE}")
+
+            # Migration/Normalization
+            save_needed = False
+            if 'bridge_ip' in config and 'bridges' not in config:
+                # Legacy format -> convert to list
+                logger.info("Migrating legacy config to new format...")
+                config = {
+                    'bridges': [{
+                        'bridge_ip': config['bridge_ip'],
+                        'username': config.get('username')
+                    }]
+                }
+                save_needed = True
+
+            if 'bridges' not in config:
+                config['bridges'] = []
+
+            if save_needed:
+                with open(CONFIG_FILE, 'w') as f:
+                    json.dump(config, f, indent=2)
+                logger.info(f"Migrated and saved configuration to {CONFIG_FILE}")
+
+            # Try to find a matching bridge for the current subnet
+            logger.info("Checking for bridge configuration matching local subnet...")
+            for bridge_cfg in config['bridges']:
+                b_ip = bridge_cfg.get('bridge_ip')
+                if b_ip and get_subnet(b_ip) == local_subnet:
+                    bridge_ip = b_ip
+                    bridge_username = bridge_cfg.get('username')
+                    logger.info(f"Found matching bridge configuration for {bridge_ip}")
+                    break
+
+            if not bridge_ip and config['bridges']:
+                logger.info("No matching bridge found for this subnet.")
+
         except Exception as e:
-            logger.error(f"Error loading config: {e}")
+            logger.error(f"Error loading/migrating config: {e}")
+            # Fallback to empty config if corrupt
+            config = {'bridges': []}
 
     # Initialize Bridge
     try:
-        # If no IP specified, attempt discovery
+        # If no IP specified/found, attempt discovery
         if not bridge_ip:
-            logger.info("No bridge IP specified, attempting discovery...")
-            bridge = Bridge()  # This will attempt discovery
-            bridge_ip = bridge.ip
-            logger.info(f"Discovered bridge at {bridge_ip}")
+            logger.info("No bridge IP configured for this subnet, attempting discovery...")
+
+            # Try native discovery first (sometimes works)
+            try:
+                # Note: Bridge() might load a default config file if it exists, yielding a stale IP
+                bridge = Bridge()
+                candidate_ip = bridge.ip
+                if get_subnet(candidate_ip) == local_subnet:
+                    bridge_ip = candidate_ip
+                    logger.info(f"Native discovery found local bridge at {bridge_ip}")
+                else:
+                    logger.info(f"Native discovery/cache found {candidate_ip}, but it's not in local subnet {local_subnet}. Ignoring.")
+            except Exception:
+                pass
+
+            if not bridge_ip:
+                # Fallback to web discovery
+                logger.info("Native discovery failed or yielded non-local IP, trying web discovery...")
+                discovered_ip = discover_bridge_ip()
+                if discovered_ip and get_subnet(discovered_ip) == local_subnet:
+                    bridge_ip = discovered_ip
+                    logger.info(f"Web discovery found bridge at {bridge_ip}")
+                elif discovered_ip:
+                     logger.warning(f"Web discovery found {discovered_ip}, but it's not in local subnet {local_subnet}. Ignoring.")
+
+                if not bridge_ip:
+                    raise Exception("Could not discover a local Hue Bridge. Please ensure you are on the same network.")
+
+        logger.info(f"Connecting to bridge at {bridge_ip}")
+        bridge = None
+        for i in range(10):  # Try for about 30 seconds
+            try:
+                # Bridge instantiation attempts connection/registration automatically
+                bridge = Bridge(bridge_ip, username=bridge_username)
+                bridge.connect()
+                break
+            except PhueRegistrationException:
+                logger.warning(f"Link button not pressed. Please press the button on your Hue Bridge now! (Attempt {i+1}/10)")
+                # Wait 3 seconds before retrying
+                await asyncio.sleep(3)
         else:
-            logger.info(f"Connecting to bridge at {bridge_ip}")
-            bridge = Bridge(bridge_ip, username=bridge_username)
+             # Final attempt or raise if loop finishes without success
+             if not bridge:
+                 bridge = Bridge(bridge_ip, username=bridge_username)
+             bridge.connect()
 
-        # Connect to the bridge (this may prompt user to press the link button)
-        bridge.connect()
+        # Save the configuration (append if new)
+        new_bridge_data = {
+            'bridge_ip': bridge.ip,
+            'username': bridge.username
+        }
 
-        # Save the configuration
+        # Check if we need to update or append
+        existing_entry = False
+        if 'bridges' not in config:
+            config['bridges'] = []
+
+        for i, b in enumerate(config['bridges']):
+            if b.get('bridge_ip') == bridge.ip:
+                config['bridges'][i] = new_bridge_data
+                existing_entry = True
+                break
+
+        if not existing_entry:
+            config['bridges'].append(new_bridge_data)
+
         with open(CONFIG_FILE, 'w') as f:
-            json.dump({
-                'bridge_ip': bridge.ip,
-                'username': bridge.username
-            }, f)
+            json.dump(config, f, indent=2)
             logger.info(f"Saved configuration to {CONFIG_FILE}")
 
         # Build a cache of light information for faster access
@@ -130,6 +249,9 @@ async def hue_lifespan(server: FastMCP) -> AsyncIterator[HueContext]:
         # Initialize and yield the context
         yield HueContext(bridge=bridge, light_info=light_info)
 
+    except PhueRegistrationException:
+         logger.error("Failed to register with Hue Bridge. Please ensure you pressed the link button.")
+         raise
     except Exception as e:
         logger.error(f"Error connecting to Hue bridge: {e}")
         # Re-raise to inform the server of the failure
@@ -137,6 +259,24 @@ async def hue_lifespan(server: FastMCP) -> AsyncIterator[HueContext]:
     finally:
         # No explicit cleanup needed for bridge
         pass
+
+# --- Utility Functions ---
+
+def discover_bridge_ip() -> str | None:
+    """
+    Discover Hue Bridge IP via meethue.com API.
+
+    This is a robust fallback when local UPnP/N-UPnP discovery fails.
+    """
+    try:
+        import urllib.request
+        with urllib.request.urlopen('https://discovery.meethue.com/', timeout=5) as response:
+            data = json.loads(response.read().decode())
+            if isinstance(data, list) and len(data) > 0:
+                return data[0].get('internalipaddress')
+    except Exception as e:
+        logger.debug(f"Web discovery failed: {e}")
+    return None
 
 # Create MCP server
 mcp = FastMCP(
@@ -1183,12 +1323,21 @@ if __name__ == "__main__":
         print(f"Starting Philips Hue MCP Server on {args.host}:{args.port}")
         print("Press Ctrl+C to stop the server")
 
-        # Run the server using mcp.run() or manually with Uvicorn
-        # mcp.run(host=args.host, port=args.port)  # Use this for direct execution
+        # Get the underlying Starlette app
+        app = mcp.sse_app()
 
-        # Or use Uvicorn for more control
+        # Add health check/probe endpoints for clients like OpenWebUI that use POST for validation
+        from starlette.responses import JSONResponse
+
+        async def handle_probe(request):
+            return JSONResponse({"status": "ok", "message": "MCP Server Running"})
+
+        # Allow POST checks on the SSE endpoint and root
+        app.add_route("/sse", handle_probe, methods=["POST"])
+        app.add_route("/", handle_probe, methods=["POST", "GET"])
+
         uvicorn.run(
-            mcp.sse_app(),
+            app,
             host=args.host,
             port=args.port,
             log_level=args.log_level
@@ -1197,4 +1346,12 @@ if __name__ == "__main__":
         print("Starting Philips Hue MCP Server in stdio mode")
         print("Press Ctrl+C to stop the server")
 
-        mcp.run(transport='stdio')
+        try:
+            mcp.run(transport='stdio')
+        except KeyboardInterrupt:
+            print("\nServer stopped.")
+            logging.shutdown()
+            sys.exit(0)
+        except Exception as e:
+            logger.error(f"Server error: {e}")
+            sys.exit(1)
