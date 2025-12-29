@@ -23,8 +23,6 @@ Setup:
     4. Configuration is saved in ~/.hue-mcp/config.json
 
 Usage:
-    # Development/testing mode with MCP Inspector
-    uv run mcp dev hue_server.py
 
     # Install in Claude Desktop
     uv run mcp install hue_server.py --name "Philips Hue"

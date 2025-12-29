@@ -6,6 +6,8 @@
 
 A powerful Model Context Protocol (MCP) interface for controlling Philips Hue smart lighting systems. Enable AI assistants like Claude to control your lights using natural language.
 
+Now supports **multiple homes/bridges** with automatic subnet detection!
+
 ## Table of Contents
 
 - [Philips Hue MCP Server](#philips-hue-mcp-server)
@@ -30,6 +32,7 @@ A powerful Model Context Protocol (MCP) interface for controlling Philips Hue sm
     - [Working with Groups](#working-with-groups)
     - [Creating Scenes](#creating-scenes)
   - [Advanced Options](#advanced-options)
+    - [Multi-Bridge Support](#multi-bridge-support)
     - [Command Line Arguments](#command-line-arguments)
     - [Development Mode](#development-mode)
   - [Troubleshooting](#troubleshooting)
@@ -50,6 +53,7 @@ This server leverages the Model Context Protocol (MCP) to provide a seamless int
 - **Scene Handling**: Apply existing scenes, create quick custom lighting scenes
 - **Activity-Based Presets**: Ready-made settings for reading, relaxation, concentration, and more
 - **Special Effects**: Access dynamic lighting effects like color loops
+- **Multi-Home Support**: Automatically detects network changes and switches to the appropriate Hue Bridge configuration
 - **Natural Language Control**: Specialized prompts for lighting control through conversation
 - **Secure Local Integration**: Connects directly to your Hue bridge on your local network
 
@@ -59,8 +63,6 @@ This server leverages the Model Context Protocol (MCP) to provide a seamless int
 # Install dependencies using uv (recommended)
 uv sync
 
-# Test with MCP Inspector
-uv run mcp dev hue_server.py
 
 # Install in Claude Desktop
 uv run mcp install hue_server.py --name "Philips Hue"
@@ -83,7 +85,7 @@ Then in Claude, start with: "I'd like to control my Philips Hue lights. Can you 
 
 ```bash
 # Clone the repository
-git clone https://github.com/ThomasRohde/hue-mcp.git
+git clone https://github.com/warshanks/hue-mcp.git
 cd hue-mcp
 
 # Install dependencies and create virtual environment automatically
@@ -97,7 +99,7 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 ```bash
 # Clone the repository
-git clone https://github.com/ThomasRohde/hue-mcp.git
+git clone https://github.com/warshanks/hue-mcp.git
 cd hue-mcp
 
 # Create and activate a virtual environment
@@ -110,14 +112,14 @@ pip install -e ".[dev]"
 
 ### First Run
 
-1. Test the server with the MCP Inspector:
+1. Run the server locally to satisfy the bridge link requirement:
 
 ```bash
-uv run mcp dev hue_server.py
+uv run python hue_server.py
 ```
 
 2. When prompted, press the link button on your Hue bridge to authorize the connection
-3. Your connection details will be saved in `~/.hue-mcp/config.json` for future use
+3. Your connection details will be saved in `~/.hue-mcp/config.json` for future use. The server supports multiple bridges and will automatically select the correct one based on your network subnet.
 
 ## Using with Claude
 
@@ -184,19 +186,7 @@ Replace `/Users/username/Projects/hue-mcp` (macOS) or `c:\\Users\\username\\Proj
 
 After updating the configuration, restart Claude Desktop for the changes to take effect.
 
-### Test with MCP Inspector
 
-For development and testing, use the MCP Inspector:
-
-```bash
-uv run mcp dev hue_server.py
-
-# With additional dependencies
-uv run mcp dev hue_server.py --with pandas
-
-# With debug logging
-uv run mcp dev hue_server.py --log-level debug
-```
 
 ## API Reference
 
@@ -289,6 +279,19 @@ quick_scene("Evening Relaxation", group_id=2, rgb=[255, 147, 41], brightness=120
 
 ## Advanced Options
 
+### Multi-Bridge Support
+
+This server handles multiple locations/bridges automatically.
+
+1.  **Detection**: The server checks your local network IP and determines your subnet (e.g., `192.168.1`).
+2.  **Selection**: It looks through `~/.hue-mcp/config.json` for a known bridge on that same subnet.
+3.  **Connection**:
+    *   If a matching bridge is found, it connects using the stored credentials.
+    *   If no match is found, it attempts to discover a bridge on the current network.
+    *   If a new bridge is discovered and linked, it is appended to the configuration.
+
+This allows you to take your laptop between home, office, or other locations with Hue bridges without needing to manually reconfigure the server each time.
+
 ### Command Line Arguments
 
 The server supports the following command line arguments when run directly:
@@ -319,8 +322,6 @@ python hue_server.py --help
 When developing or testing:
 
 ```bash
-# Use MCP dev command for automatic reloading
-uv run mcp dev hue_server.py --log-level debug
 
 # Or run directly with uv (stdio is default)
 uv run python hue_server.py --log-level debug
@@ -329,29 +330,32 @@ uv run python hue_server.py --log-level debug
 ## Troubleshooting
 
 - **Bridge not found**: If automatic discovery doesn't work, you have two options:
-  1. Manually edit the `BRIDGE_IP` variable in the script with your bridge's IP address
-  2. Manually create a config file:
-     ```bash
-     # Create the config directory
-     mkdir -p ~/.hue-mcp
-     
-     # Create a config.json file with your bridge IP
-     echo '{"bridge_ip": "192.168.1.x"}' > ~/.hue-mcp/config.json
+  1. Manually edit the `BRIDGE_IP` variable in `hue_server.py` with your bridge's IP address.
+  2. Manually create a config file in `~/.hue-mcp/config.json` with the following list format:
+     ```json
+     {
+       "bridges": [
+         {
+           "bridge_ip": "192.168.1.100",
+           "username": "your-bridge-username"
+         }
+       ]
+     }
      ```
-     Replace "192.168.1.x" with your actual Hue bridge IP address
-     
-- **Connection issues**: Delete `~/.hue-mcp/config.json` and restart the server to re-authenticate
-- **Light control not working**: Use `refresh_lights` tool to update the light information cache
-- **Groups or scenes not showing up**: Restart the bridge and server to sync all data
+
+- **Connection issues**: Delete `~/.hue-mcp/config.json` and restart the server to trigger a fresh discovery and authentication process.
+- **Light control not working**: Use `refresh_lights` tool to update the light information cache.
+- **Groups or scenes not showing up**: Restart the bridge and server to sync all data.
 
 ## How It Works
 
 This server connects to your Philips Hue bridge using the `phue` Python library and exposes functionality through the Model Context Protocol. When an AI like Claude connects:
 
-1. The server authenticates with your bridge using stored credentials
-2. It provides resources that describe your lighting setup
-3. It exposes tools that Claude can use to control your lights
-4. It offers prompts that help Claude understand how to interact with your lights
+1. The server identifies the correct bridge for your current network.
+2. It authenticates using stored credentials (or asks you to press the Link Button on the bridge).
+3. It provides resources that describe your lighting setup.
+4. It exposes tools that Claude can use to control your lights.
+5. It offers prompts that help Claude understand how to interact with your lights.
 
 All communication with your Hue system happens locally within your network for security and privacy.
 
@@ -390,8 +394,6 @@ uv run ruff check --fix hue_server.py
 # Type check
 uv run mypy hue_server.py
 
-# Test with MCP Inspector
-uv run mcp dev hue_server.py --log-level debug
 ```
 
 ## License

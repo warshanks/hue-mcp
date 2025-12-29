@@ -35,9 +35,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/ThomasRohde/hue-mcp"
-Repository = "https://github.com/ThomasRohde/hue-mcp"
-Issues = "https://github.com/ThomasRohde/hue-mcp/issues"
+Homepage = "https://github.com/warshanks/hue-mcp"
+Repository = "https://github.com/warshanks/hue-mcp"
+Issues = "https://github.com/warshanks/hue-mcp/issues"
 
 [tool.ruff]
 line-length = 100
